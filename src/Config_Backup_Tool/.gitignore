@@ -1,0 +1,24 @@
+# --- Secrets & keys ---
+.env
+*.age
+age-key*
+keyEnc*
+*.key
+id_ed25519*
+
+# --- Real device inventory (keep only devices.example.json in git) ---
+devices.json
+devices.json.bak
+devices_test.json
+
+# --- Backups (even encrypted ones) & logs ---
+backups/
+*.cfg
+*.cfg.age
+backup.log*
+
+# --- Python ---
+__pycache__/
+*.pyc
+venv/
+.venv/
