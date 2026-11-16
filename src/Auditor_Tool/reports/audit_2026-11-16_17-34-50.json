@@ -1,0 +1,214 @@
+{
+  "generated": "2026-11-16T17:34:50",
+  "devices": [
+    {
+      "device": "MSW",
+      "source": "ssh://192.168.100.3",
+      "summary": {
+        "High": 0,
+        "Medium": 9,
+        "Low": 2
+      },
+      "findings": [
+        {
+          "device": "MSW",
+          "rule_id": "L2-01",
+          "severity": "Medium",
+          "title": "DHCP snooping not enabled (rogue DHCP risk)",
+          "fix": "Configure 'ip dhcp snooping' and 'ip dhcp snooping vlan <ids>'; trust only uplinks.",
+          "evidence": [
+            "'ip dhcp snooping vlan' not configured"
+          ]
+        },
+        {
+          "device": "MSW",
+          "rule_id": "L2-02",
+          "severity": "Medium",
+          "title": "Dynamic ARP Inspection not enabled (ARP spoofing risk)",
+          "fix": "Configure 'ip arp inspection vlan <ids>' (requires DHCP snooping bindings).",
+          "evidence": [
+            "'ip arp inspection vlan' not configured"
+          ]
+        },
+        {
+          "device": "MSW",
+          "rule_id": "L2-03",
+          "severity": "Medium",
+          "title": "Access ports without port security (CAM overflow risk)",
+          "fix": "Under each access port: 'switchport port-security' with a sensible maximum and violation mode.",
+          "evidence": [
+            "GigabitEthernet0/0: port-security not enabled",
+            "GigabitEthernet0/1: port-security not enabled"
+          ]
+        },
+        {
+          "device": "MSW",
+          "rule_id": "L2-04",
+          "severity": "Medium",
+          "title": "Access ports without BPDU Guard (STP manipulation risk)",
+          "fix": "Use 'spanning-tree portfast bpduguard default' or 'spanning-tree bpduguard enable' per port.",
+          "evidence": [
+            "GigabitEthernet0/0: BPDU Guard not enabled",
+            "GigabitEthernet0/1: BPDU Guard not enabled"
+          ]
+        },
+        {
+          "device": "MSW",
+          "rule_id": "L2-05",
+          "severity": "Medium",
+          "title": "Ports left in dynamic trunking mode (VLAN hopping risk)",
+          "fix": "Set 'switchport mode access' (or 'trunk' with 'switchport nonegotiate') on every port.",
+          "evidence": [
+            "GigabitEthernet0/3: no fixed 'switchport mode' (DTP active)",
+            "GigabitEthernet1/0: no fixed 'switchport mode' (DTP active)",
+            "GigabitEthernet1/1: no fixed 'switchport mode' (DTP active)",
+            "GigabitEthernet1/2: no fixed 'switchport mode' (DTP active)",
+            "GigabitEthernet1/3: no fixed 'switchport mode' (DTP active)"
+          ]
+        },
+        {
+          "device": "MSW",
+          "rule_id": "MGT-03",
+          "severity": "Medium",
+          "title": "VTY lines not restricted by an ACL",
+          "fix": "Create a management ACL and apply it with 'access-class <acl> in' under 'line vty'.",
+          "evidence": [
+            "line vty 0 4: no 'access-class'",
+            "line vty 5 15: no 'access-class'"
+          ]
+        },
+        {
+          "device": "MSW",
+          "rule_id": "MGT-05",
+          "severity": "Medium",
+          "title": "HTTP server enabled",
+          "fix": "Disable with 'no ip http server'.",
+          "evidence": [
+            "'ip http server' is enabled"
+          ]
+        },
+        {
+          "device": "MSW",
+          "rule_id": "MGT-06",
+          "severity": "Medium",
+          "title": "AAA not enabled",
+          "fix": "Enable 'aaa new-model' and configure AAA (TACACS+/RADIUS or local).",
+          "evidence": [
+            "'aaa new-model' not configured"
+          ]
+        },
+        {
+          "device": "MSW",
+          "rule_id": "PWD-03",
+          "severity": "Medium",
+          "title": "Local users defined with 'password' instead of 'secret'",
+          "fix": "Recreate users with 'username <name> privilege <n> secret <password>'.",
+          "evidence": [
+            "user 'admin' uses 'password' instead of 'secret'"
+          ]
+        },
+        {
+          "device": "MSW",
+          "rule_id": "LOG-01",
+          "severity": "Low",
+          "title": "No remote logging configured",
+          "fix": "Configure 'logging host <syslog-ip>'.",
+          "evidence": [
+            "no 'logging host' configured"
+          ]
+        },
+        {
+          "device": "MSW",
+          "rule_id": "SVC-01",
+          "severity": "Low",
+          "title": "CDP enabled globally (reconnaissance risk)",
+          "fix": "Disable with 'no cdp run', or disable per-interface on untrusted ports.",
+          "evidence": [
+            "CDP is enabled globally"
+          ]
+        }
+      ]
+    },
+    {
+      "device": "R1",
+      "source": "ssh://192.168.10.1",
+      "summary": {
+        "High": 1,
+        "Medium": 3,
+        "Low": 3
+      },
+      "findings": [
+        {
+          "device": "R1",
+          "rule_id": "PWD-01",
+          "severity": "High",
+          "title": "Privileged EXEC not protected by a strong 'enable secret'",
+          "fix": "Use 'enable secret' (type 8/9) and remove 'enable password'.",
+          "evidence": [
+            "'enable secret' not configured"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "MGT-03",
+          "severity": "Medium",
+          "title": "VTY lines not restricted by an ACL",
+          "fix": "Create a management ACL and apply it with 'access-class <acl> in' under 'line vty'.",
+          "evidence": [
+            "line vty 0 4: no 'access-class'"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "MGT-06",
+          "severity": "Medium",
+          "title": "AAA not enabled",
+          "fix": "Enable 'aaa new-model' and configure AAA (TACACS+/RADIUS or local).",
+          "evidence": [
+            "'aaa new-model' not configured"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "PWD-03",
+          "severity": "Medium",
+          "title": "Local users defined with 'password' instead of 'secret'",
+          "fix": "Recreate users with 'username <name> privilege <n> secret <password>'.",
+          "evidence": [
+            "user 'admin' uses 'password' instead of 'secret'"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "BAN-01",
+          "severity": "Low",
+          "title": "No login/MOTD banner",
+          "fix": "Configure 'banner motd' with an authorized-access warning.",
+          "evidence": [
+            "no banner configured"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "LOG-01",
+          "severity": "Low",
+          "title": "No remote logging configured",
+          "fix": "Configure 'logging host <syslog-ip>'.",
+          "evidence": [
+            "no 'logging host' configured"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "SVC-01",
+          "severity": "Low",
+          "title": "CDP enabled globally (reconnaissance risk)",
+          "fix": "Disable with 'no cdp run', or disable per-interface on untrusted ports.",
+          "evidence": [
+            "CDP is enabled globally"
+          ]
+        }
+      ]
+    }
+  ]
+}

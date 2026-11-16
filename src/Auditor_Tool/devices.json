@@ -1,0 +1,16 @@
+[
+  {
+    "name": "MSW",
+    "host": "192.168.100.3",
+    "username": "admin",
+    "password_env": "MSW_PASS",
+    "device_type": "cisco_ios"
+  },
+  {
+    "name": "R1",
+    "host": "192.168.10.1",
+    "username": "admin",
+    "password_env": "R1_PASS",
+    "device_type": "cisco_ios"
+  }
+]
