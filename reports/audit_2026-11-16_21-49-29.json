@@ -1,0 +1,86 @@
+{
+  "generated": "2026-11-16T21:49:29",
+  "devices": [
+    {
+      "device": "R1",
+      "source": "ssh://192.168.10.1",
+      "summary": {
+        "High": 1,
+        "Medium": 3,
+        "Low": 3
+      },
+      "findings": [
+        {
+          "device": "R1",
+          "rule_id": "PWD-01",
+          "severity": "High",
+          "title": "Privileged EXEC not protected by a strong 'enable secret'",
+          "fix": "Use 'enable secret' (type 8/9) and remove 'enable password'.",
+          "evidence": [
+            "'enable secret' not configured"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "MGT-03",
+          "severity": "Medium",
+          "title": "VTY lines not restricted by an ACL",
+          "fix": "Create a management ACL and apply it with 'access-class <acl> in' under 'line vty'.",
+          "evidence": [
+            "line vty 0 4: no 'access-class'"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "MGT-06",
+          "severity": "Medium",
+          "title": "AAA not enabled",
+          "fix": "Enable 'aaa new-model' and configure AAA (TACACS+/RADIUS or local).",
+          "evidence": [
+            "'aaa new-model' not configured"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "PWD-03",
+          "severity": "Medium",
+          "title": "Local users defined with 'password' instead of 'secret'",
+          "fix": "Recreate users with 'username <name> privilege <n> secret <password>'.",
+          "evidence": [
+            "user 'admin' uses 'password' instead of 'secret'"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "BAN-01",
+          "severity": "Low",
+          "title": "No login/MOTD banner",
+          "fix": "Configure 'banner motd' with an authorized-access warning.",
+          "evidence": [
+            "no banner configured"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "LOG-01",
+          "severity": "Low",
+          "title": "No remote logging configured",
+          "fix": "Configure 'logging host <syslog-ip>'.",
+          "evidence": [
+            "no 'logging host' configured"
+          ]
+        },
+        {
+          "device": "R1",
+          "rule_id": "SVC-01",
+          "severity": "Low",
+          "title": "CDP enabled globally (reconnaissance risk)",
+          "fix": "Disable with 'no cdp run', or disable per-interface on untrusted ports.",
+          "evidence": [
+            "CDP is enabled globally"
+          ]
+        }
+      ]
+    }
+  ]
+}
