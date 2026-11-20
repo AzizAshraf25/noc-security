@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Config Backup Tool - NOC Automation (v3, cross-platform)
-=========================================================
+Config Backup Tool - NOC Automation (v4, cross-platform, with alerts)
+=====================================================================
 - Reads the list of network devices you maintain manually in devices.json
 - Pulls the running-config from every device (in parallel)
 - Saves each device's backups in its own folder:
@@ -11,6 +11,9 @@ Config Backup Tool - NOC Automation (v3, cross-platform)
   backup of every device
 - Can run automatically every day at a fixed time (--schedule HH:MM)
 - Optional git commit/push (--push)
+- NEW (phase 3) Alerts after every cycle:
+    * Telegram : one summary message (OK or FAILED, with the failed devices)
+    * Zabbix   : per-device result sent with zabbix_sender to trapper items
 
 Works on Linux and Windows.
 
@@ -19,6 +22,8 @@ Usage examples:
     python Config_Backup_Tool.py --schedule 02:00     # stay alive, back up daily at 02:00
     python Config_Backup_Tool.py --retention-days 15  # (default is 15)
     python Config_Backup_Tool.py --push               # also git commit + push
+    python Config_Backup_Tool.py --alert-only-failures  # Telegram only when something fails
+    python Config_Backup_Tool.py --no-alerts          # disable Telegram + Zabbix
 
 Recommended scheduling:
     Linux   : systemd service or cron (run without --schedule)
@@ -30,6 +35,25 @@ Requirements:
     pip install netmiko
     age (https://github.com/FiloSottile/age) available in PATH
     AGE_RECIPIENT environment variable set to your age PUBLIC key (age1...)
+
+Alert settings (all via environment variables, never in the code):
+    TELEGRAM_BOT_TOKEN   bot token from @BotFather
+    TELEGRAM_CHAT_ID     chat/user id that receives the alerts
+    ZABBIX_SERVER        IP/DNS of the Zabbix server or proxy (enables Zabbix alerts)
+    ZABBIX_PORT          optional, default 10051
+    ZABBIX_SENDER        optional full path to zabbix_sender(.exe) if it is not in PATH
+  Windows (then open a NEW terminal):
+    setx TELEGRAM_BOT_TOKEN "123456:ABC..."
+    setx TELEGRAM_CHAT_ID "123456789"
+    setx ZABBIX_SERVER "192.168.100.10"
+  An alert channel whose variables are not set is simply skipped.
+
+Zabbix side (per device host, host name must match the device name exactly,
+or set "zabbix_host" in devices.json):
+    item 1: key config.backup.status   type Zabbix trapper, Numeric (unsigned)  0 = OK, 1 = FAILED
+    item 2: key config.backup.message  type Zabbix trapper, Text
+    trigger: last(/HOST/config.backup.status)=1
+    trigger: nodata(/HOST/config.backup.status,26h)=1   (script did not run at all)
 """
 
 import argparse
@@ -41,6 +65,9 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -77,6 +104,15 @@ DEFAULT_RETENTION_DAYS = 15
 
 # age PUBLIC key (starts with age1...). The private key must stay offline.
 AGE_RECIPIENT = os.environ.get("AGE_RECIPIENT")
+
+# Alert settings (environment variables only - never hard-code secrets)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+ZABBIX_SERVER = os.environ.get("ZABBIX_SERVER")
+ZABBIX_PORT = os.environ.get("ZABBIX_PORT", "10051")
+ZABBIX_SENDER = os.environ.get("ZABBIX_SENDER") or shutil.which("zabbix_sender")
+ZABBIX_STATUS_KEY = "config.backup.status"    # 0 = OK, 1 = FAILED
+ZABBIX_MESSAGE_KEY = "config.backup.message"  # text: saved file or error
 
 # Command used to fetch the config for each device type (add more as needed)
 SHOW_RUN_COMMANDS = {
@@ -167,10 +203,11 @@ def load_devices(devices_file: Path) -> list:
     """
     Read the devices JSON file. Each device looks like this:
     {
-        "name": "CORE-SW1",            // optional: folder name (otherwise taken from the device prompt)
-        "host": "192.168.1.1",
+        "name": "MSW",            // optional: folder name (otherwise taken from the device prompt)
+        "zabbix_host": "Multi-Layer Switch",     // optional: host name in Zabbix (defaults to "name")
+        "host": "192.168.100.3",
         "username": "admin",
-        "password": "xxx",             // or "password_env": "NAME_OF_ENV_VAR"
+        "password_env": "MSW_PASS",             // or "password_env": "NAME_OF_ENV_VAR"
         "device_type": "cisco_ios",
         "secret": "enable_password",   // optional (or "secret_env")
         "key_file": "/path/to/key"     // optional: SSH key instead of a password
@@ -259,7 +296,15 @@ def backup_device(device: dict, encrypt: bool) -> dict:
     device_type = device.get("device_type", "cisco_ios")
     command = SHOW_RUN_COMMANDS.get(device_type, "show running-config")
 
-    result = {"host": host, "success": False, "filename": None, "error": None}
+    result = {
+        "host": host,
+        # "name" is what alerts show; it is refined below once the real hostname is known
+        "name": safe_name(device.get("name") or host),
+        "zabbix_host": device.get("zabbix_host"),
+        "success": False,
+        "filename": None,
+        "error": None,
+    }
 
     try:
         params = build_connection_params(device)
@@ -281,6 +326,7 @@ def backup_device(device: dict, encrypt: bool) -> dict:
                 except (NetmikoBaseException, OSError, ValueError):
                     hostname = host
             hostname = safe_name(hostname or host)
+            result["name"] = hostname
 
             output = conn.send_command(command, read_timeout=60)
 
@@ -383,6 +429,121 @@ def cleanup_old_backups(retention_days: int) -> int:
 
 
 # ----------------------------------------------------------------------------
+# Alerts: Telegram + Zabbix
+# ----------------------------------------------------------------------------
+def send_telegram(text: str) -> bool:
+    """
+    Send a message through the Telegram Bot API (plain HTTPS POST).
+    The token comes from the environment and is never logged: the URL contains
+    it, so error messages only show the exception type / HTTP code.
+    """
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        logger.info("Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID); skipping.")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode(
+        {"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]}  # Telegram limit is 4096 chars
+    ).encode("utf-8")
+    try:
+        with urllib.request.urlopen(url, data=data, timeout=15) as resp:
+            ok = resp.status == 200
+    except urllib.error.HTTPError as e:
+        logger.error(f"Telegram alert failed: HTTP {e.code}")
+        return False
+    except (urllib.error.URLError, OSError) as e:
+        logger.error(f"Telegram alert failed: {type(e).__name__}")
+        return False
+
+    if ok:
+        logger.info("Telegram alert sent.")
+    return ok
+
+
+def _zabbix_quote(value) -> str:
+    """Quote a field for the zabbix_sender input file (single line, no inner quotes/backslashes)."""
+    text = " ".join(str(value).split())            # collapse newlines and extra whitespace
+    text = text.replace("\\", "/").replace('"', "'")
+    return f'"{text}"'
+
+
+def send_zabbix(results: list) -> bool:
+    """
+    Send every device result to Zabbix trapper items with ONE zabbix_sender call
+    (input read from stdin). For each device:
+        config.backup.status   0 = OK, 1 = FAILED
+        config.backup.message  saved file name or the error text
+    The host name in Zabbix must match r["zabbix_host"] (or the device name).
+    """
+    if not ZABBIX_SERVER:
+        logger.info("Zabbix not configured (ZABBIX_SERVER); skipping.")
+        return False
+    if not ZABBIX_SENDER:
+        logger.warning("zabbix_sender was not found in PATH (or set ZABBIX_SENDER); skipping Zabbix.")
+        return False
+
+    lines = []
+    for r in results:
+        zhost = _zabbix_quote(r.get("zabbix_host") or r["name"])
+        status = 0 if r["success"] else 1
+        message = (r["filename"] if r["success"] else r["error"]) or ""
+        lines.append(f"{zhost} {ZABBIX_STATUS_KEY} {status}")
+        lines.append(f"{zhost} {ZABBIX_MESSAGE_KEY} {_zabbix_quote(message[:250])}")
+
+    cmd = [ZABBIX_SENDER, "-z", ZABBIX_SERVER, "-p", str(ZABBIX_PORT), "-i", "-"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input="\n".join(lines) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.error(f"zabbix_sender failed to run: {type(e).__name__}")
+        return False
+
+    summary = (proc.stdout or proc.stderr or "").strip().splitlines()
+    summary_line = next((l for l in reversed(summary) if "processed:" in l), "")
+    if proc.returncode == 0:
+        logger.info(f"Zabbix: {summary_line or 'data sent'}")
+        return True
+
+    # Return code 2 = some values failed (e.g. host/item does not exist in Zabbix)
+    logger.error(f"Zabbix: sender returned {proc.returncode}. {summary_line or ' | '.join(summary[-3:])}")
+    return False
+
+
+def build_alert_text(results: list, deleted: int, retention_days: int) -> str:
+    failed = [r for r in results if not r["success"]]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if failed:
+        lines = [f"❌ Config backup: {len(failed)}/{len(results)} FAILED ({now})"]
+        for r in failed:
+            lines.append(f"- {r['name']} ({r['host']}): {r['error']}")
+        ok_names = [r["name"] for r in results if r["success"]]
+        if ok_names:
+            lines.append("OK: " + ", ".join(sorted(ok_names)))
+    else:
+        lines = [f"✅ Config backup OK: {len(results)}/{len(results)} devices ({now})"]
+    lines.append(f"Retention: removed {deleted} file(s) older than {retention_days} days")
+    return "\n".join(lines)
+
+
+def send_alerts(results: list, deleted: int, args) -> None:
+    """Send results to Zabbix and Telegram. An alert problem never breaks the backup."""
+    if args.no_alerts:
+        return
+    try:
+        send_zabbix(results)
+        has_failures = any(not r["success"] for r in results)
+        if has_failures or not args.alert_only_failures:
+            send_telegram(build_alert_text(results, deleted, args.retention_days))
+    except Exception:
+        logger.exception("Unexpected error while sending alerts")
+
+
+# ----------------------------------------------------------------------------
 # Git (optional)
 # ----------------------------------------------------------------------------
 def run_git_command(args: list, cwd: Path) -> tuple:
@@ -431,7 +592,7 @@ def git_commit_and_push(results: list, branch: str) -> None:
 # ----------------------------------------------------------------------------
 # One full backup cycle
 # ----------------------------------------------------------------------------
-def run_backup_cycle(args) -> None:
+def _run_backup_cycle(args) -> None:
     logger.info("=" * 60)
     logger.info("Starting config backup")
 
@@ -445,13 +606,32 @@ def run_backup_cycle(args) -> None:
     for r in failed:
         logger.warning(f"  Failed: {r['host']} - {r['error']}")
 
-    cleanup_old_backups(args.retention_days)
+    deleted = cleanup_old_backups(args.retention_days)
+
+    # Alerts go out before git so a push problem can never swallow them
+    send_alerts(results, deleted, args)
 
     if args.push:
         git_commit_and_push(results, args.branch)
 
     logger.info("Backup cycle finished.")
     logger.info("=" * 60)
+
+
+def run_backup_cycle(args) -> None:
+    """
+    Run one cycle. If the whole cycle aborts (bad devices.json, unexpected error)
+    a Telegram alert is sent, then the error is re-raised as before.
+    """
+    try:
+        _run_backup_cycle(args)
+    except (Exception, SystemExit):
+        if not args.no_alerts:
+            send_telegram(
+                f"❌ Config backup cycle ABORTED ({datetime.now():%Y-%m-%d %H:%M}). "
+                "Check backup.log on the automation PC."
+            )
+        raise
 
 
 # ----------------------------------------------------------------------------
@@ -513,6 +693,11 @@ def main():
                         help="(not recommended) store configs as plaintext instead of encrypting with age")
     parser.add_argument("--no-acl", action="store_true",
                         help="Windows only: do not modify folder ACLs with icacls")
+    parser.add_argument("--no-alerts", action="store_true",
+                        help="disable all alerts (Telegram + Zabbix)")
+    parser.add_argument("--alert-only-failures", action="store_true",
+                        help="send the Telegram message only when a backup fails "
+                             "(Zabbix still receives every result)")
     args = parser.parse_args()
 
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -534,6 +719,14 @@ def main():
             hint = "winget install FiloSottile.age" if IS_WINDOWS else "sudo apt install age"
             logger.error(f"'age' was not found in PATH. Install it ({hint}) or use --no-encrypt.")
             sys.exit(1)
+
+    if not args.no_alerts:
+        channels = []
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            channels.append("Telegram")
+        if ZABBIX_SERVER:
+            channels.append("Zabbix")
+        logger.info(f"Alerts enabled: {', '.join(channels) if channels else 'none configured'}")
 
     if args.schedule:
         run_scheduler(args)
