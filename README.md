@@ -56,6 +56,7 @@ noc-security/
 ├── src/
 │   ├── Config_Backup_Tool/   # backup, encryption, Telegram and Zabbix alerts
 │   └── Auditor_Tool/         # configuration security auditor
+│   └── Zabbix_Alerts/        # configuraton alerts
 ├── docs/                     # topology and tool documentation / screenshots
 ├── evidence/                 # proof of runs in the lab
 └── reports/                  # sample audit reports
@@ -72,6 +73,7 @@ Then follow the README of the tool you want to use:
 
 1. [Config Backup Tool](src/Config_Backup_Tool/): set up the device inventory and run your first backup.
 2. [Config Auditor](src/Auditor_Tool/): audit the backups and review the report.
+3. [Alerts](src/Zabbix_Alerts/): alerts (Zabbix & Telegram) for each backup.
 
 Requirements: Python 3 and access to your network devices over SSH. Each tool lists its own dependencies.
 
@@ -86,8 +88,8 @@ Requirements: Python 3 and access to your network devices over SSH. Each tool li
 - [x] Automated configuration backup with retention
 - [x] Telegram and Zabbix notifications for backup results
 - [x] Configuration security auditor
-- [ ] Send auditor findings to Telegram and Zabbix
-- [ ] Change detection between backups
+- [x] Send auditor findings to Telegram and Zabbix
+- [x] Change detection between backups
 - [ ] Port scanner for service exposure checks
 - [ ] Log analyzer and IOC checker for SOC use cases
 
