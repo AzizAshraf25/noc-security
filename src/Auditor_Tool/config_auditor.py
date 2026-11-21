@@ -472,8 +472,8 @@ def _extract_findings_signature(json_file: Path) -> list:
 
 def save_evidence_snapshot(results, json_path: Path, md_path: Path, stamp: str, evidence_dir: Path):
     """
-    - يحفظ نسخة واحدة في evidence/before عند وجود ثغرات لأول مرة.
-    - يقارن الفحص الجديد بآخر نسخة في before: لو حصل تغيير يحفظ في after، ولو مفيش اختلاف يتجاهله.
+    - BEFORE: يتحفظ مرة واحدة عند أول ظهور للثغرات.
+    - AFTER: يتحفظ كل ما النتيجة تختلف عن BEFORE وعن آخر AFTER.
     """
     total_findings = sum(len(i["findings"]) for i in results.values())
     before_dir = evidence_dir / "before"
@@ -482,34 +482,33 @@ def save_evidence_snapshot(results, json_path: Path, md_path: Path, stamp: str, 
     before_jsons = sorted(before_dir.rglob("*.json")) if before_dir.exists() else []
     after_jsons = sorted(after_dir.rglob("*.json")) if after_dir.exists() else []
 
-    # 1. حالة عدم وجود نسخة سابقة في before
-    if not before_jsons:
-        if total_findings > 0:
-            target = before_dir / stamp
-            target.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(json_path, target / json_path.name)
-            shutil.copy2(md_path, target / md_path.name)
-            print(f"[+] Evidence saved (BEFORE hardening): {target}")
-        return
-
-    # 2. حالة وجود نسخة سابقة في before -> نقارن النتيجة الحالية بآخر نسخة في before
-    latest_before_json = before_jsons[-1]
-    before_sig = _extract_findings_signature(latest_before_json)
-    current_sig = _extract_findings_signature(json_path)
-
-    if current_sig == before_sig:
-        print("[=] No changes detected compared to BEFORE evidence; skipping AFTER snapshot.")
-        return
-
-    # 3. حصل اختلاف فعلي عن before -> نحفظ في after (مرة واحدة)
-    if not after_jsons:
-        target = after_dir / stamp
+    def _save(base_dir: Path, label: str):
+        target = base_dir / stamp
         target.mkdir(parents=True, exist_ok=True)
         shutil.copy2(json_path, target / json_path.name)
         shutil.copy2(md_path, target / md_path.name)
-        print(f"[+] Changes detected! Evidence saved (AFTER hardening): {target}")
-    else:
-        print("[=] Changes detected, but AFTER evidence snapshot already exists.")
+        print(f"[+] Evidence saved ({label}): {target}")
+
+    # 1. مفيش BEFORE لسه
+    if not before_jsons:
+        if total_findings > 0:
+            _save(before_dir, "BEFORE hardening")
+        return
+
+    current_sig = _extract_findings_signature(json_path)
+
+    # 2. نفس حالة BEFORE -> مفيش تغيير
+    if current_sig == _extract_findings_signature(before_jsons[-1]):
+        print("[=] No changes detected compared to BEFORE evidence; skipping AFTER snapshot.")
+        return
+
+    # 3. نفس حالة آخر AFTER -> متكررش
+    if after_jsons and current_sig == _extract_findings_signature(after_jsons[-1]):
+        print("[=] Results identical to the latest AFTER snapshot; skipping.")
+        return
+
+    # 4. فيه تغيير جديد -> احفظ AFTER جديد (القديم بيفضل زي ما هو)
+    _save(after_dir, "AFTER hardening")
 
 
 # --------------------------------------------------------------------------
