@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Multi-target TCP port scanner with exposure checking.
+"""TCP port scanner and exposure checker with two scan engines.
 
-Scans hosts or networks for open TCP ports (full connect scan), optionally grabs
-service banners, and can compare the result with an "expected ports" policy to
-report unexpected exposure and expected services that are down.
+Engines
+  builtin  pure-Python connect scan (no dependencies)
+  nmap     runs nmap, parses its XML output and applies the same checks
+
+For either engine the tool tells apart open / closed / filtered ports, can compare
+the result with an "expected ports" policy (unexpected exposure, expected services
+not reachable), writes JSON, and returns exit code 1 when the policy is violated.
 
 Use it only on systems you own or are explicitly authorized to test.
 """
@@ -11,10 +15,15 @@ Use it only on systems you own or are explicitly authorized to test.
 import argparse
 import ipaddress
 import json
+import os
+import shlex
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
@@ -22,6 +31,7 @@ from queue import Empty, Queue
 TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 389, 443, 445, 465, 587,
              993, 995, 1433, 1521, 3306, 3389, 5432, 5900, 8080, 8443]
 HTTP_PORTS = {80, 8000, 8008, 8080, 8081}
+DEFAULT_THREADS, DEFAULT_TIMEOUT, DEFAULT_RETRIES = 100, 1.0, 1
 
 
 # --------------------------------------------------------------------------
@@ -49,6 +59,19 @@ def parse_ports(spec):
     if not ports:
         raise argparse.ArgumentTypeError("no ports given")
     return sorted(ports)
+
+
+def ports_to_spec(ports):
+    """Compress [1,2,3,8,9] into '1-3,8-9' (compact nmap -p argument)."""
+    ranges, start, prev = [], ports[0], ports[0]
+    for port in ports[1:]:
+        if port == prev + 1:
+            prev = port
+            continue
+        ranges.append((start, prev))
+        start = prev = port
+    ranges.append((start, prev))
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in ranges)
 
 
 def expand_targets(items):
@@ -95,23 +118,45 @@ def load_expected(path):
     return expected
 
 
-# --------------------------------------------------------------------------
-# Scanning
-# --------------------------------------------------------------------------
-def scan_port(host, port, timeout):
-    """Return True if the TCP port is open (completes the three-way handshake)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        return sock.connect_ex((host, port)) == 0
+def new_result():
+    return {"open": [], "closed": 0, "filtered": 0, "states": {}, "services": {}}
 
 
-def scan(targets, ports, threads, timeout):
-    """Scan every (host, port) pair with a pool of worker threads."""
+# --------------------------------------------------------------------------
+# Engine 1: built-in connect scan
+# --------------------------------------------------------------------------
+def probe(host, port, timeout, retries):
+    """Return the state of one TCP port: 'open', 'closed' or 'filtered'.
+
+    open     - the three-way handshake completed
+    closed   - the host answered with a reset (RST): reachable, nothing listening
+    filtered - no usable answer (dropped by a firewall, host down, or overloaded);
+               the probe is retried `retries` more times before giving up
+    """
+    for _ in range(retries + 1):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                sock.connect((host, port))
+            return "open"
+        except ConnectionRefusedError:
+            return "closed"
+        except OSError:  # timeout, host/network unreachable, ...
+            continue
+    return "filtered"
+
+
+def scan_builtin(targets, ports, threads, timeout, retries, track):
+    """Probe every (host, port) pair with a pool of worker threads.
+
+    `track` is the set of ports whose non-open state must be remembered
+    (the ports mentioned in the expected-ports policy).
+    """
     queue = Queue()
     for host in targets:
         for port in ports:
             queue.put((host, port))
-    open_ports = {host: [] for host in targets}
+    results = {h: new_result() for h in targets}
     lock = threading.Lock()
 
     def worker():
@@ -120,23 +165,22 @@ def scan(targets, ports, threads, timeout):
                 host, port = queue.get_nowait()
             except Empty:
                 return
-            if scan_port(host, port, timeout):
-                with lock:
-                    open_ports[host].append(port)
+            state = probe(host, port, timeout, retries)
+            with lock:
+                entry = results[host]
+                if state == "open":
+                    entry["open"].append(port)
+                else:
+                    entry[state] += 1
+                    if port in track:
+                        entry["states"][port] = state
 
     pool = [threading.Thread(target=worker) for _ in range(min(threads, queue.qsize()))]
     for t in pool:
         t.start()
     for t in pool:
         t.join()
-    return {host: sorted(found) for host, found in open_ports.items()}
-
-
-def service_name(port):
-    try:
-        return socket.getservbyport(port, "tcp")
-    except OSError:
-        return "unknown"
+    return results
 
 
 def grab_banner(host, port, timeout):
@@ -161,32 +205,126 @@ def grab_banner(host, port, timeout):
 
 
 # --------------------------------------------------------------------------
+# Engine 2: nmap wrapper
+# --------------------------------------------------------------------------
+def parse_nmap_xml(xml_text, targets, track):
+    """Convert nmap XML output into the same per-host result structure as the built-in engine."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise SystemExit(f"Could not parse nmap output: {exc}")
+    results = {h: new_result() for h in targets}
+    banners = {}
+    for host in root.findall("host"):
+        addr = host.find("address[@addrtype='ipv4']")
+        if addr is None or addr.get("addr") not in results:
+            continue
+        ip = addr.get("addr")
+        entry = results[ip]
+        ports_el = host.find("ports")
+        if ports_el is None:
+            continue
+        # nmap collapses the most common state into <extraports>
+        default_state = "closed"
+        for extra in ports_el.findall("extraports"):
+            kind = "filtered" if "filtered" in extra.get("state", "") else "closed"
+            entry[kind] += int(extra.get("count", 0))
+            default_state = kind
+        for port_el in ports_el.findall("port"):
+            if port_el.get("protocol") != "tcp":
+                continue
+            port = int(port_el.get("portid"))
+            state = port_el.find("state").get("state")
+            if state == "open":
+                entry["open"].append(port)
+                svc = port_el.find("service")
+                if svc is not None:
+                    entry["services"][port] = svc.get("name", "unknown")
+                    text = " ".join(filter(None, (svc.get("product"), svc.get("version"),
+                                                  svc.get("extrainfo"))))
+                    if text:
+                        banners[(ip, port)] = text[:80]
+            else:
+                kind = "filtered" if "filtered" in state else "closed"
+                entry[kind] += 1
+                if port in track:
+                    entry["states"][port] = kind
+        for port in track:  # tracked ports that nmap folded into <extraports>
+            if port not in entry["open"] and port not in entry["states"]:
+                entry["states"][port] = default_state
+    return root, results, banners
+
+
+def scan_nmap(targets, ports, args, track):
+    exe = args.nmap_path or shutil.which("nmap")
+    if not exe:
+        sys.exit("nmap not found. Install it from https://nmap.org and add it to PATH, "
+                 "or pass --nmap-path.")
+    cmd = [exe, "-oX", "-", "-n", "-Pn", f"-{args.nmap_scan}", "-p", ports_to_spec(ports)]
+    if args.banner:
+        cmd += ["-sV", "--version-light"]
+    if args.timing is not None:
+        cmd.append(f"-T{args.timing}")
+    if args.retries is not None:
+        cmd += ["--max-retries", str(args.retries)]
+    if args.timeout is not None:
+        cmd += ["--max-rtt-timeout", f"{int(args.timeout * 1000)}ms"]
+    if args.nmap_args:
+        cmd += shlex.split(args.nmap_args, posix=(os.name != "nt"))
+    cmd += targets
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        sys.exit(f"Could not run nmap: {exc}")
+    if proc.returncode != 0:
+        sys.exit(f"nmap failed (exit {proc.returncode}):\n{proc.stderr.strip()}")
+    root, results, banners = parse_nmap_xml(proc.stdout, targets, track)
+    info = {"engine": f"nmap {root.get('version', '')}".strip(), "nmap_command": root.get("args", "")}
+    return results, banners, info
+
+
+# --------------------------------------------------------------------------
 # Results
 # --------------------------------------------------------------------------
-def build_results(open_ports, scanned_ports, banners, expected_map):
+def service_name(port):
+    try:
+        return socket.getservbyport(port, "tcp")
+    except OSError:
+        return "unknown"
+
+
+def build_results(results, scanned_ports, banners, expected_map):
     scanned = set(scanned_ports)
     hosts = []
-    for host, found in open_ports.items():
+    for host, res in results.items():
+        found = sorted(res["open"])
         expected = None
         if expected_map is not None:
             expected = expected_map.get(host, expected_map.get("*"))
         entry = {
             "host": host,
-            "open": [{"port": p, "service": service_name(p), "banner": banners.get((host, p), "")}
-                     for p in found],
+            "open": [{"port": p, "service": res["services"].get(p) or service_name(p),
+                      "banner": banners.get((host, p), "")} for p in found],
+            "counts": {"open": len(found), "closed": res["closed"], "filtered": res["filtered"]},
             "expected": sorted(expected) if expected is not None else None,
             "unexpected_open": [],
-            "expected_closed": [],
+            "expected_down": [],
         }
         if expected is not None:
             entry["unexpected_open"] = sorted(set(found) - expected)
-            entry["expected_closed"] = sorted((expected & scanned) - set(found))
+            entry["expected_down"] = [
+                {"port": p, "state": res["states"].get(p, "closed")}
+                for p in sorted((expected & scanned) - set(found))
+            ]
         hosts.append(entry)
     return hosts
 
 
 def print_report(hosts, show_banner):
     for entry in hosts:
+        counts = entry["counts"]
+        total = sum(counts.values())
         print(f"\n{entry['host']}")
         if not entry["open"]:
             print("  no open ports found")
@@ -196,26 +334,47 @@ def print_report(hosts, show_banner):
             for item in entry["open"]:
                 row = f"  {item['port']:<7}{item['service']:<12}"
                 print((row + item["banner"]).rstrip() if show_banner else row.rstrip())
+        print(f"  ports: {counts['open']} open, {counts['closed']} closed, {counts['filtered']} filtered")
+        if total and counts["filtered"] / total > 0.5:
+            print("  [!] Most ports gave no response (filtered). The host may be down, firewalled or "
+                  "overloaded. Try fewer --threads, a higher --timeout, or more --retries before "
+                  "trusting this result.")
         if entry["unexpected_open"]:
             print(f"  [!] UNEXPECTED open: {', '.join(map(str, entry['unexpected_open']))}")
-        if entry["expected_closed"]:
-            print(f"  [!] EXPECTED but closed: {', '.join(map(str, entry['expected_closed']))}")
+        if entry["expected_down"]:
+            down = ", ".join(f"{d['port']} ({d['state']})" for d in entry["expected_down"])
+            print(f"  [!] EXPECTED but not open: {down}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-target TCP port scanner")
+    parser = argparse.ArgumentParser(description="TCP port scanner and exposure checker (builtin or nmap engine)")
     parser.add_argument("targets", nargs="*", help="IPs, hostnames or CIDR networks (e.g. 10.0.0.0/28)")
     parser.add_argument("-iL", "--input-file", help="file with one target per line (# for comments)")
     parser.add_argument("-p", "--ports", type=parse_ports, default="1-1024",
                         help="ports: 22,80,443 | 1-1024 | top (default: 1-1024)")
-    parser.add_argument("-t", "--threads", type=int, default=100, help="worker threads (default: 100)")
-    parser.add_argument("--timeout", type=float, default=1.0, help="seconds per port (default: 1.0)")
-    parser.add_argument("--banner", action="store_true", help="grab service banners from open ports")
+    parser.add_argument("--engine", choices=["builtin", "nmap"], default="builtin",
+                        help="scan engine (default: builtin)")
+    parser.add_argument("-t", "--threads", type=int,
+                        help=f"worker threads, builtin only (default: {DEFAULT_THREADS})")
+    parser.add_argument("--timeout", type=float,
+                        help=f"seconds per attempt (builtin default: {DEFAULT_TIMEOUT}; "
+                             "nmap: max RTT timeout, unset by default so nmap adapts)")
+    parser.add_argument("--retries", type=int,
+                        help=f"extra attempts for ports that give no answer (builtin default: "
+                             f"{DEFAULT_RETRIES}; nmap: its own default unless set)")
+    parser.add_argument("--banner", action="store_true",
+                        help="identify services (builtin: read banners; nmap: -sV --version-light)")
     parser.add_argument("--expected", help="JSON file with the expected open ports per host")
     parser.add_argument("--vantage", default="", help="where the scan runs from, e.g. LAN or WAN (recorded in the output)")
     parser.add_argument("--json", dest="json_path", help="write the results to this JSON file")
     parser.add_argument("--max-hosts", type=int, default=256,
                         help="refuse to scan more hosts than this (default: 256)")
+    nm = parser.add_argument_group("nmap engine options")
+    nm.add_argument("--nmap-path", help="path to nmap if it is not in PATH")
+    nm.add_argument("--nmap-scan", choices=["sT", "sS"], default="sT",
+                    help="sT = connect scan (no admin needed), sS = SYN scan (needs admin/root and Npcap on Windows)")
+    nm.add_argument("--timing", type=int, choices=range(0, 6), help="nmap timing template 0-5 (-T)")
+    nm.add_argument("--nmap-args", help='extra nmap arguments; write them with "=", e.g. --nmap-args="--reason"')
     args = parser.parse_args()
 
     items = list(args.targets)
@@ -228,35 +387,44 @@ def main():
     if len(targets) > args.max_hosts:
         sys.exit(f"{len(targets)} hosts exceeds --max-hosts {args.max_hosts}; raise it deliberately if intended")
     expected_map = load_expected(args.expected) if args.expected else None
+    track = set().union(*expected_map.values()) if expected_map else set()
 
     where = f' from "{args.vantage}"' if args.vantage else ""
-    print(f"Scanning {len(targets)} host(s), {len(args.ports)} port(s) each{where}...")
+    print(f"Scanning {len(targets)} host(s), {len(args.ports)} port(s) each, engine: {args.engine}{where}...")
     started = datetime.now()
     clock = time.time()
 
-    open_ports = scan(targets, args.ports, args.threads, args.timeout)
-
     banners = {}
-    if args.banner:
-        for host, found in open_ports.items():
-            for port in found:
-                banners[(host, port)] = grab_banner(host, port, args.timeout)
+    if args.engine == "nmap":
+        if args.threads is not None:
+            print("note: --threads is ignored by the nmap engine (use --timing instead)")
+        results, banners, info = scan_nmap(targets, args.ports, args, track)
+    else:
+        threads = args.threads or DEFAULT_THREADS
+        timeout = args.timeout if args.timeout is not None else DEFAULT_TIMEOUT
+        retries = max(0, args.retries if args.retries is not None else DEFAULT_RETRIES)
+        results = scan_builtin(targets, args.ports, threads, timeout, retries, track)
+        if args.banner:
+            for host, res in results.items():
+                for port in res["open"]:
+                    banners[(host, port)] = grab_banner(host, port, timeout)
+        info = {"engine": "builtin", "threads": threads, "timeout": timeout, "retries": retries}
 
     duration = time.time() - clock
-    hosts = build_results(open_ports, args.ports, banners, expected_map)
+    hosts = build_results(results, args.ports, banners, expected_map)
     print_report(hosts, args.banner)
 
-    total_open = sum(len(h["open"]) for h in hosts)
+    total_open = sum(h["counts"]["open"] for h in hosts)
     unexpected = sum(len(h["unexpected_open"]) for h in hosts)
-    closed = sum(len(h["expected_closed"]) for h in hosts)
+    down = sum(len(h["expected_down"]) for h in hosts)
     print(f"\nDone in {duration:.2f}s: {total_open} open port(s) on {len(hosts)} host(s)", end="")
-    print(f", {unexpected} unexpected, {closed} expected but closed" if expected_map is not None else "")
+    print(f", {unexpected} unexpected, {down} expected but not open" if expected_map is not None else "")
 
     if args.json_path:
         payload = {
             "scan": {"vantage": args.vantage, "started": started.isoformat(timespec="seconds"),
                      "duration_seconds": round(duration, 2), "ports_scanned": len(args.ports),
-                     "targets": targets},
+                     "targets": targets, **info},
             "hosts": hosts,
         }
         out = Path(args.json_path)
@@ -264,7 +432,7 @@ def main():
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"Results written to {out}")
 
-    if expected_map is not None and (unexpected or closed):
+    if expected_map is not None and (unexpected or down):
         sys.exit(1)
 
 
