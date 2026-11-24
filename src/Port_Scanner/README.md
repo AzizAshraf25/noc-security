@@ -160,5 +160,3 @@ A full connect scan completes the handshake, so the target and the firewall log 
 - [x] Multi-target scanning, policy check, JSON output
 - [x] open / closed / filtered states and retries
 - [x] nmap engine wrapper
-- [ ] Compare two JSON scans automatically (before/after)
-- [ ] Send deviations to Telegram and Zabbix
