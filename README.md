@@ -90,8 +90,7 @@ Requirements: Python 3 and access to your network devices over SSH. Each tool li
 - [x] Configuration security auditor
 - [x] Send auditor findings to Telegram and Zabbix
 - [x] Change detection between backups
-- [ ] Port scanner for service exposure checks
-- [ ] Log analyzer and IOC checker for SOC use cases
+- [x] Port scanner for service exposure checks
 
 ## Author
 
