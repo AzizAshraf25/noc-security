@@ -1,0 +1,6 @@
+{
+  "_comment": "Allowed open TCP ports per host. The '*' entry applies to hosts that are not listed. Adjust to your lab.",
+  "192.168.100.3": [22],
+  "192.168.100.5": [22, 80, 443, 10051],
+  "*": []
+}
