@@ -154,10 +154,6 @@ A full connect scan completes the handshake, so the target and the firewall log 
 - Version detection (`--banner` with nmap) is slow and sends extra probes.
 - Dead hosts cost time with the built-in engine: every port waits for the timeout.
 
-## Notes
-
-- (fill in: what I learned, in my own words)
-- (fill in: how I used AI assistance, and what I reviewed, tested and changed myself)
 
 ## Roadmap
 
